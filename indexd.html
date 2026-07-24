@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Song to Piano Translator</title>
+<style>
+  body { font-family: sans-serif; background:#f7f7f5; color:#222; margin:0; padding:2rem; }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 1rem; }
+  .controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom: 1rem; }
+  button { padding: 8px 16px; border-radius: 6px; border: 1px solid #ccc; background:#fff; cursor:pointer; font-size:14px; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  #status { font-size:13px; color:#666; }
+  #noteLabel { font-size:22px; font-weight:600; min-height:28px; margin-bottom: 0.5rem; }
+  #pianoWrap { overflow-x:auto; padding:8px 0; background:#fff; border-radius:8px; border:1px solid #ddd; }
+  svg { display:block; }
+  .hint { font-size:13px; color:#666; margin-top:1rem; line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Song to piano translator</h1>
+  <div class="controls">
+    <input type="file" id="fileInput" accept="audio/*" />
+    <button id="playBtn" disabled>Play</button>
+    <button id="soundCheckBtn">Sound check</button>
+    <span id="status">Upload an audio file to begin</span>
+  </div>
+  <div class="controls">
+    <label style="font-size:13px;display:flex;align-items:center;gap:6px;">
+      Cut off notes above:
+      <input type="range" id="maxPitchSlider" min="48" max="96" value="84" />
+      <span id="maxPitchLabel">C6</span>
+    </label>
+    <button id="autoCutoffBtn" disabled>Auto-detect cutoff</button>
+  </div>
+  <div id="noteLabel"></div>
+  <div id="pianoWrap">
+    <svg id="piano" viewBox="0 0 1160 160" style="width:100%;min-width:900px;height:160px"></svg>
+  </div>
+  <p class="hint">
+    Detects up to 10 simultaneous notes per moment (chords, harmonies, bass + melody together)
+    using spectral peak-picking, then plays back only those detected notes as piano tones —
+    not the original song audio. On a full mixed song this is an approximation, not true
+    vocal isolation: it can't cleanly separate voice from instruments, so expect some
+    extra or missing notes, especially with drums or heavy distortion.
+    Everything runs locally in your browser — no upload to any server.
+    <br/><br/>
+    The "emphasize center-panned audio" option is a rough heuristic (mid/side channel
+    processing), not true vocal separation — it reduces hard-panned instruments but
+    won't cleanly remove centered bass, kick drums, or other centered instruments.
+    For clean vocal-only stems, use a dedicated separation tool (e.g. a Demucs- or
+    Spleeter-based service) before uploading here.
+  </p>
+</div>
+
+<script>
+const NOTE_NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const startMidi=48, endMidi=84;
+const whiteSet=new Set([0,2,4,5,7,9,11]);
+let keyEls={};
+
+function midiInfo(m){
+  const n=NOTE_NAMES[m%12];
+  const oct=Math.floor(m/12)-1;
+  const isWhite=whiteSet.has(m%12);
+  return {name:n+oct, isWhite};
+}
+
+function buildPiano(){
+  const svg=document.getElementById('piano');
+  let whiteX=0;
+  const whiteW=44, whiteH=150, blackW=26, blackH=95;
+  const whites=[], blacks=[];
+  for(let m=startMidi;m<=endMidi;m++){
+    const info=midiInfo(m);
+    if(info.isWhite){ whites.push({m,x:whiteX}); whiteX+=whiteW; }
+  }
+  whiteX=0;
+  for(let m=startMidi;m<=endMidi;m++){
+    const info=midiInfo(m);
+    if(info.isWhite){ whiteX+=whiteW; }
+    else { blacks.push({m,x:whiteX-blackW/2}); }
+  }
+  let html='';
+  whites.forEach(w=>{
+    html+=`<rect data-m="${w.m}" x="${w.x}" y="5" width="${whiteW-2}" height="${whiteH}" rx="3" fill="#ffffff" stroke="#999" stroke-width="1"/>`;
+  });
+  blacks.forEach(b=>{
+    html+=`<rect data-m="${b.m}" x="${b.x}" y="5" width="${blackW}" height="${blackH}" rx="3" fill="#222"/>`;
+  });
+  svg.setAttribute('viewBox', `0 0 ${whiteX+10} 160`);
+  svg.innerHTML=html;
+  svg.querySelectorAll('rect').forEach(r=>{ keyEls[r.dataset.m]=r; });
+}
+buildPiano();
+
+function freqToMidi(f){ return Math.round(69+12*Math.log2(f/440)); }
+
+// In-place iterative radix-2 FFT
+function fft(re, im){
+  const n = re.length;
+  for(let i=1, j=0; i<n; i++){
+    let bit = n>>1;
+    for(; j&bit; bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){ [re[i],re[j]]=[re[j],re[i]]; [im[i],im[j]]=[im[j],im[i]]; }
+  }
+  for(let len=2; len<=n; len<<=1){
+    const ang = -2*Math.PI/len;
+    const wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0; i<n; i+=len){
+      let curWr=1, curWi=0;
+      for(let j=0; j<len/2; j++){
+        const ur=re[i+j], ui=im[i+j];
+        const vr=re[i+j+len/2]*curWr - im[i+j+len/2]*curWi;
+        const vi=re[i+j+len/2]*curWi + im[i+j+len/2]*curWr;
+        re[i+j]=ur+vr; im[i+j]=ui+vi;
+        re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
+        const nWr=curWr*wr-curWi*wi, nWi=curWr*wi+curWi*wr;
+        curWr=nWr; curWi=nWi;
+      }
+    }
+  }
+}
+
+// Detect up to maxNotes simultaneous pitches in a frame via spectral peak-picking
+function detectMultiPitch(frame, sampleRate, maxNotes){
+  const N=frame.length;
+  const re=new Float64Array(N), im=new Float64Array(N);
+  // Hann window to reduce spectral leakage
+  for(let i=0;i<N;i++){
+    const w = 0.5*(1-Math.cos(2*Math.PI*i/(N-1)));
+    re[i]=frame[i]*w;
+  }
+  fft(re, im);
+  const half=N/2;
+  const mags=new Float64Array(half);
+  let maxMag=0;
+  for(let i=0;i<half;i++){
+    mags[i]=Math.sqrt(re[i]*re[i]+im[i]*im[i]);
+    if(mags[i]>maxMag) maxMag=mags[i];
+  }
+  if(maxMag<0.5) return [];
+  const minBin=Math.max(1, Math.round(60*N/sampleRate));
+  const maxBin=Math.min(half-2, Math.round(1600*N/sampleRate));
+  const peaks=[];
+  for(let i=minBin;i<=maxBin;i++){
+    if(mags[i]>mags[i-1] && mags[i]>=mags[i+1] && mags[i] > maxMag*0.06){
+      // Parabolic interpolation across the 3 bins around the peak for sub-bin frequency precision
+      const a=mags[i-1], b=mags[i], c=mags[i+1];
+      const denom=(a-2*b+c);
+      const delta = denom!==0 ? 0.5*(a-c)/denom : 0;
+      const trueBin = i + Math.max(-0.5, Math.min(0.5, delta));
+      const freq = trueBin*sampleRate/N;
+      peaks.push({freq, mag:mags[i]});
+    }
+  }
+  peaks.sort((a,b)=>b.mag-a.mag);
+  const accepted=[]; // {freq} of peaks already accepted as fundamentals
+  const seenMidi=new Set();
+  const result=[];
+  for(const p of peaks){
+    // reject if this peak is close to an integer multiple (harmonic) of an already-accepted,
+    // stronger peak — it's very likely an overtone of that note, not an independent pitch
+    let isHarmonic=false;
+    for(const f of accepted){
+      for(let h=2; h<=6; h++){
+        const ratio = p.freq / f;
+        if(Math.abs(ratio - h) / h < 0.03){ isHarmonic=true; break; }
+      }
+      if(isHarmonic) break;
+    }
+    if(isHarmonic) continue;
+    const midi=freqToMidi(p.freq);
+    if(seenMidi.has(midi)) continue;
+    seenMidi.add(midi);
+    accepted.push(p.freq);
+    result.push(midi);
+    if(result.length>=maxNotes) break;
+  }
+  return result;
+}
+
+let audioCtx, audioBuffer, framePitches=[], sourceNode, isPlaying=false, startTime=0, rafId;
+const statusEl=document.getElementById('status');
+const playBtn=document.getElementById('playBtn');
+const noteLabel=document.getElementById('noteLabel');
+
+const maxPitchSlider=document.getElementById('maxPitchSlider');
+const maxPitchLabel=document.getElementById('maxPitchLabel');
+function updateMaxPitchLabel(){
+  maxPitchLabel.textContent = midiInfo(Number(maxPitchSlider.value)).name;
+}
+maxPitchSlider.addEventListener('input', updateMaxPitchLabel);
+updateMaxPitchLabel();
+
+document.getElementById('fileInput').addEventListener('change', async (e)=>{
+  const file=e.target.files[0];
+  if(!file) return;
+  statusEl.textContent='Decoding audio...';
+  playBtn.disabled=true;
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  const arrayBuf = await file.arrayBuffer();
+  audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+  await analyzePitch((pct)=>{ statusEl.textContent='Analyzing pitch... '+pct+'%'; });
+  statusEl.textContent='Ready to play: '+file.name;
+  playBtn.disabled=false;
+  document.getElementById('autoCutoffBtn').disabled=false;
+});
+
+async function analyzePitch(onProgress){
+  const data = audioBuffer.numberOfChannels>1 ? mixDown(audioBuffer) : audioBuffer.getChannelData(0);
+  const sr=audioBuffer.sampleRate;
+  const frameSize=4096, hop=Math.max(256, Math.round(sr/50));
+  framePitches=[];
+  const total=Math.floor((data.length-frameSize)/hop);
+  let count=0;
+  for(let i=0;i+frameSize<data.length;i+=hop){
+    const frame=data.subarray(i,i+frameSize);
+    const midis=detectMultiPitch(frame, sr, 4);
+    const t=i/sr;
+    framePitches.push({t, midis});
+    count++;
+    if(count%15===0){
+      if(onProgress) onProgress(Math.round(100*count/total));
+      await new Promise(r=>setTimeout(r,0));
+    }
+  }
+}
+function mixDown(buf){
+  const ch0=buf.getChannelData(0), ch1=buf.getChannelData(1);
+  const out=new Float32Array(ch0.length);
+  for(let i=0;i<ch0.length;i++) out[i]=(ch0[i]+ch1[i])/2;
+  return out;
+}
+
+let activeMidis=new Set();
+function highlightSet(midiSet){
+  for(const m of activeMidis){
+    if(!midiSet.has(m) && keyEls[m]){
+      const w=whiteSet.has(m%12);
+      keyEls[m].setAttribute('fill', w?'#ffffff':'#222');
+    }
+  }
+  for(const m of midiSet){
+    if(keyEls[m]) keyEls[m].setAttribute('fill', '#3878d8');
+  }
+  activeMidis=midiSet;
+  if(midiSet.size===0){
+    noteLabel.textContent='';
+  } else {
+    noteLabel.textContent=[...midiSet].sort((a,b)=>a-b).map(m=>midiInfo(m).name).join(' + ');
+  }
+}
+
+function getActiveNotesAt(t){
+  const set=new Set();
+  for(const n of noteSeq){
+    if(n.start<=t && t<n.end) set.add(n.midi);
+  }
+  return set;
+}
+
+function tick(){
+  if(!isPlaying) return;
+  const elapsed=audioCtx.currentTime-startTime;
+  const totalDur = noteSeq.length ? Math.max(...noteSeq.map(n=>n.end)) : 0;
+  if(elapsed>totalDur){
+    highlightSet(new Set());
+    return;
+  }
+  highlightSet(getActiveNotesAt(elapsed));
+  rafId=requestAnimationFrame(tick);
+}
+
+// Build polyphonic note events by diffing active pitch sets frame-to-frame
+function buildNoteSequence(){
+  if(framePitches.length===0) return [];
+  const frameDur = framePitches.length>1 ? (framePitches[1].t - framePitches[0].t) : 0.1;
+  const tolerance=Math.max(1, Math.round(0.15/frameDur)); // ~150ms, converted to frame count at current fps
+  const active={}; // midi -> {start, lastSeenIdx}
+  const finished=[];
+  framePitches.forEach((f, idx)=>{
+    const curSet=new Set(f.midis);
+    for(const m of curSet){
+      if(active[m]) active[m].lastSeenIdx=idx;
+      else active[m]={start:f.t, lastSeenIdx:idx};
+    }
+    for(const m of Object.keys(active)){
+      const mi=Number(m);
+      if(idx-active[mi].lastSeenIdx>tolerance){
+        finished.push({midi:mi, start:active[mi].start, end:framePitches[active[mi].lastSeenIdx].t+frameDur});
+        delete active[mi];
+      }
+    }
+  });
+  const lastIdx=framePitches.length-1;
+  for(const m of Object.keys(active)){
+    const mi=Number(m);
+    finished.push({midi:mi, start:active[mi].start, end:framePitches[active[mi].lastSeenIdx].t+frameDur});
+  }
+  return finished.filter(n => (n.end-n.start) > 0.15);
+}
+
+function midiToFreq(m){ return 440 * Math.pow(2, (m-69)/12); }
+
+// Guess a good cutoff pitch to separate melody/vocals from background.
+// Idea: vocals/lead melody usually occupy a fairly narrow, continuously-held band in the
+// upper-mid register and dominate total "sung time" there, while background instruments
+// (bass, chords, pads) spread more evenly across a lower band. Build a duration-weighted
+// histogram per semitone, smooth it, then look for the deepest valley — the point where
+// density drops off between the two registers — restricted to a plausible vocal range.
+function guessVocalCutoff(seq){
+  const hist=new Float64Array(128);
+  for(const n of seq){
+    if(n.midi>=0 && n.midi<128) hist[n.midi]+=(n.end-n.start);
+  }
+  // smooth with a small moving average to avoid picking noise as the valley
+  const smooth=new Float64Array(128);
+  const w=2;
+  for(let i=0;i<128;i++){
+    let sum=0,count=0;
+    for(let j=Math.max(0,i-w); j<=Math.min(127,i+w); j++){ sum+=hist[j]; count++; }
+    smooth[i]=sum/count;
+  }
+  const lo=55, hi=84; // G3..C6: plausible region for a melody/vocal-vs-background split
+  let bestIdx=-1, bestScore=-Infinity;
+  for(let i=lo;i<=hi;i++){
+    const belowWindow=smooth.slice(Math.max(0,i-8), i);
+    const aboveWindow=smooth.slice(i+1, Math.min(128,i+9));
+    const belowPeak=belowWindow.length ? Math.max(...belowWindow) : 0;
+    const abovePeak=aboveWindow.length ? Math.max(...aboveWindow) : 0;
+    if(belowPeak<=0 || abovePeak<=0) continue; // need real content on both sides
+    // deeper valley relative to the peaks flanking it scores higher
+    const score = Math.min(belowPeak, abovePeak) - smooth[i];
+    if(score>bestScore){ bestScore=score; bestIdx=i; }
+  }
+  return bestIdx>=0 ? bestIdx : 72; // fallback: C5
+}
+
+let activeOscillators=[];
+let noteSeq=[];
+function stopAllTones(){
+  activeOscillators.forEach(o=>{ try{ o.stop(); }catch(e){} });
+  activeOscillators=[];
+}
+
+document.getElementById('soundCheckBtn').addEventListener('click', async ()=>{
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  if(audioCtx.state==='suspended'){
+    try{ await audioCtx.resume(); }catch(e){ console.error(e); }
+  }
+  statusEl.textContent='Playing test beep... (you should hear a 1s tone)';
+  const osc=audioCtx.createOscillator();
+  const gain=audioCtx.createGain();
+  osc.type='sine';
+  osc.frequency.value=440;
+  gain.gain.setValueAtTime(0, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(0.2, audioCtx.currentTime+0.02);
+  gain.gain.setValueAtTime(0.2, audioCtx.currentTime+0.9);
+  gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime+1);
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime+1.05);
+  setTimeout(()=>{
+    statusEl.textContent = audioCtx.state==='running'
+      ? 'Test beep finished. Heard it? Audio path is working — if the song still plays silently, the issue is in note scheduling.'
+      : 'AudioContext state is "'+audioCtx.state+'" — it may be blocked. Try clicking again.';
+  }, 1100);
+});
+
+document.getElementById('autoCutoffBtn').addEventListener('click', ()=>{
+  if(!audioBuffer) return;
+  const fullSeq = buildNoteSequence(); // unfiltered, full pitch range
+  if(fullSeq.length===0){ statusEl.textContent='No notes to analyze.'; return; }
+  const cutoff = guessVocalCutoff(fullSeq);
+  maxPitchSlider.value = cutoff;
+  updateMaxPitchLabel();
+  statusEl.textContent = 'Guessed cutoff: '+midiInfo(cutoff).name+' — this is a rough heuristic, adjust by ear.';
+});
+
+playBtn.addEventListener('click', async ()=>{
+  if(audioCtx && audioCtx.state==='suspended'){
+    try{ await audioCtx.resume(); }catch(e){ console.error(e); }
+  }
+  if(isPlaying){
+    stopAllTones();
+    isPlaying=false; playBtn.textContent='Play'; highlightSet(new Set());
+    cancelAnimationFrame(rafId);
+    return;
+  }
+  noteSeq = buildNoteSequence();
+  const maxPitch = Number(maxPitchSlider.value);
+  noteSeq = noteSeq.filter(n => n.midi <= maxPitch);
+  if(noteSeq.length===0){ statusEl.textContent='No clear notes detected in this audio.'; return; }
+  console.log('[song-to-piano] noteSeq count:', noteSeq.length);
+  console.log('[song-to-piano] first 10 notes:', noteSeq.slice(0,10));
+  console.log('[song-to-piano] last 5 notes:', noteSeq.slice(-5));
+  const durs = noteSeq.map(n=>n.end-n.start);
+  console.log('[song-to-piano] duration min/max/avg:', Math.min(...durs), Math.max(...durs), (durs.reduce((a,b)=>a+b,0)/durs.length).toFixed(3));
+  const freqs = noteSeq.map(n=>midiToFreq(n.midi));
+  console.log('[song-to-piano] freq min/max:', Math.min(...freqs).toFixed(1), Math.max(...freqs).toFixed(1));
+  let scheduleErrors=0;
+  const schedStart = audioCtx.currentTime + 0.1;
+  console.log('[song-to-piano] audioCtx.state:', audioCtx.state, 'currentTime:', audioCtx.currentTime, 'schedStart:', schedStart);
+
+  // Limit simultaneous polyphony instead of capping total note count, so the whole song
+  // still plays — dense moments just get thinned to the longest-held notes at that instant,
+  // rather than losing entire sections.
+  const MAX_SIMULTANEOUS = 5;
+  noteSeq.sort((a,b)=>a.start-b.start);
+  const active=[]; // {end, midi} currently sounding, kept sorted by end time
+  const toPlay=[];
+  for(const n of noteSeq){
+    // drop anything that's finished by this note's start
+    for(let i=active.length-1;i>=0;i--){ if(active[i].end<=n.start) active.splice(i,1); }
+    if(active.length < MAX_SIMULTANEOUS){
+      active.push({end:n.end, midi:n.midi});
+      toPlay.push(n);
+    } else {
+      // too crowded: only take this note if it outlasts the shortest-remaining active note
+      let shortestIdx=0;
+      for(let i=1;i<active.length;i++){ if(active[i].end<active[shortestIdx].end) shortestIdx=i; }
+      if(n.end > active[shortestIdx].end){
+        active.splice(shortestIdx,1);
+        active.push({end:n.end, midi:n.midi});
+        toPlay.push(n);
+      }
+      // else: skip this one note only — song keeps playing, just slightly thinner here
+    }
+  }
+  console.log('[song-to-piano] kept', toPlay.length, 'of', noteSeq.length, 'notes after polyphony limiting');
+  noteSeq = toPlay;
+
+  // Shared compressor prevents overload/clipping when many notes overlap
+  const masterComp = audioCtx.createDynamicsCompressor();
+  masterComp.threshold.value = -24;
+  masterComp.knee.value = 30;
+  masterComp.ratio.value = 12;
+  masterComp.attack.value = 0.003;
+  masterComp.release.value = 0.25;
+  masterComp.connect(audioCtx.destination);
+
+  noteSeq.forEach((n, idx)=>{
+    try{
+      const osc=audioCtx.createOscillator();
+      const gain=audioCtx.createGain();
+      osc.type='sine';
+      osc.frequency.value = midiToFreq(n.midi);
+      const dur = n.end - n.start;
+      const noteStart = schedStart + n.start;
+      const noteEnd = noteStart + dur;
+      const peakGain = 0.35;
+      const decayTarget = 0.001; // exponential ramps can't hit 0, use near-silent floor
+      gain.gain.setValueAtTime(0.0001, noteStart);
+      gain.gain.exponentialRampToValueAtTime(peakGain, noteStart + 0.012); // quick attack
+      const decayEnd = Math.max(noteStart + 0.02, noteEnd - 0.03);
+      gain.gain.exponentialRampToValueAtTime(decayTarget, decayEnd); // natural decay, like a struck note
+      gain.gain.linearRampToValueAtTime(0, noteEnd); // final fade to true silence
+      osc.connect(gain); gain.connect(masterComp);
+      osc.start(noteStart);
+      osc.stop(noteEnd + 0.02);
+      activeOscillators.push(osc);
+    } catch(err){
+      scheduleErrors++;
+      if(scheduleErrors<=5) console.error('[song-to-piano] error scheduling note', idx, n, err);
+    }
+  });
+  console.log('[song-to-piano] scheduled', activeOscillators.length, 'oscillators,', scheduleErrors, 'errors');
+  statusEl.textContent = 'Playing '+activeOscillators.length+' notes ('+scheduleErrors+' errors) — check console for details';
+  const totalDur = Math.max(...noteSeq.map(n=>n.end));
+  startTime = schedStart;
+  isPlaying=true;
+  playBtn.textContent='Stop';
+  const endCheck = setInterval(()=>{
+    if(!isPlaying){ clearInterval(endCheck); return; }
+    if(audioCtx.currentTime - startTime > totalDur){
+      isPlaying=false; playBtn.textContent='Play'; highlightSet(new Set());
+      clearInterval(endCheck);
+    }
+  }, 100);
+  tick();
+});
+</script>
+</body>
+</html>
